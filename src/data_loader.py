@@ -14,23 +14,19 @@ REQUIRED_FIELDS = {
 
 
 def normalize_text(value: str) -> str:
-    """
-    Normalize text so we can compare values consistently.
-    """
     return " ".join(value.strip().casefold().split())
 
 
 def validate_book(book: Any, index: int) -> dict[str, str]:
-    """
-    Validate one book and return its cleaned values.
-    """
-    # We expect every item from the JSON file to be an object.
+
+    #Validate one book and return its cleaned values.
+    #We expect every item from the JSON file to be an object.
     if not isinstance(book, dict):
         raise ValueError(
             f"Book at index {index} must be a JSON object."
         )
 
-    # We check that every required field is available.
+    #checking that every required field is available.
     missing_fields = REQUIRED_FIELDS - book.keys()
 
     if missing_fields:
@@ -43,7 +39,7 @@ def validate_book(book: Any, index: int) -> dict[str, str]:
 
     cleaned_book: dict[str, str] = {}
 
-    # We clean and validate each value before using it.
+    #We clean and validate each value before using it.
     for field in REQUIRED_FIELDS:
         value = book[field]
 
@@ -69,20 +65,19 @@ def validate_book(book: Any, index: int) -> dict[str, str]:
 def remove_duplicate_books(
     books: list[dict[str, str]],
 ) -> list[dict[str, str]]:
-    """
-    Remove duplicate books based on title and author.
-    """
+
+    #Remove duplicate books based on title and author
     unique_books: list[dict[str, str]] = []
     seen_books: set[tuple[str, str]] = set()
 
     for book in books:
-        # We normalize the title and author before comparing them.
+        #We normalize the title and author before comparing them
         book_key = (
             normalize_text(book["title"]),
             normalize_text(book["author"]),
         )
 
-        # We keep only the first occurrence of every book.
+        #Keeping only the first occurrence of every book.
         if book_key in seen_books:
             continue
 
@@ -95,12 +90,12 @@ def remove_duplicate_books(
 def load_books(
     file_path: Path | str = BOOKS_FILE_PATH,
 ) -> list[dict[str, str]]:
-    """
-    Load, validate and return the books from a JSON file.
-    """
+
+    #Load, validate and return the books from a JSON file
+
     path = Path(file_path)
 
-    # We check the path before trying to open the file.
+    #We check the path before trying to open the file
     if not path.exists():
         raise FileNotFoundError(
             f"Books file was not found: {path}"
@@ -112,7 +107,7 @@ def load_books(
         )
 
     try:
-        # We use UTF-8 because book descriptions may contain special characters.
+        # UTF-8 because book descriptions may contain special characters.
         with path.open("r", encoding="utf-8") as file:
             raw_data = json.load(file)
 
@@ -126,7 +121,6 @@ def load_books(
             f"The books file could not be read: {error}"
         ) from error
 
-    # We expect the JSON root to contain a list of books.
     if not isinstance(raw_data, list):
         raise ValueError(
             "The books JSON file must contain a list."
@@ -134,12 +128,12 @@ def load_books(
 
     validated_books: list[dict[str, str]] = []
 
-    # We validate every book before adding it to the final list.
+    #Validate every book before adding it to the final list.
     for index, raw_book in enumerate(raw_data):
         validated_book = validate_book(raw_book, index)
         validated_books.append(validated_book)
 
-    # We remove repeated entries before returning the library.
+    #We remove repeated entries before returning the library.
     unique_books = remove_duplicate_books(validated_books)
 
     return unique_books
@@ -148,13 +142,11 @@ def load_books(
 def build_books_by_title(
     books: list[dict[str, str]],
 ) -> dict[str, dict[str, str]]:
-    """
-    Build a lookup dictionary using normalized book titles.
-    """
+
+    #Build a lookup dictionary using normalized book titles.
     books_by_title: dict[str, dict[str, str]] = {}
 
     for book in books:
-        # We use a normalized title as the dictionary key.
         normalized_title = normalize_text(book["title"])
         books_by_title[normalized_title] = book
 
@@ -165,19 +157,18 @@ def get_book_by_title(
     title: str,
     books: list[dict[str, str]],
 ) -> dict[str, str] | None:
-    """
-    Return a book that matches the given title.
-    """
+
+    #Return a book that matches the given title
     if not isinstance(title, str):
         raise TypeError("The title must be a string.")
 
-    # We normalize the received title before searching for it.
+    #We normalize the received title before searching for it.
     normalized_title = normalize_text(title)
 
     if not normalized_title:
         return None
 
-    # We build a lookup dictionary for a direct title search.
+    #building a lookup dictionary for a direct title search.
     books_by_title = build_books_by_title(books)
 
     return books_by_title.get(normalized_title)
@@ -185,7 +176,6 @@ def get_book_by_title(
 
 if __name__ == "__main__":
     try:
-        # We run a small check when this file is executed directly.
         loaded_books = load_books()
 
         print(f"Loaded {len(loaded_books)} valid books.")
