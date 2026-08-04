@@ -6,14 +6,17 @@ import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
 
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 CSV_FILE = PROJECT_ROOT / "good_reads.csv"
 OUTPUT_FILE = PROJECT_ROOT / "data" / "books.json"
 
-import pandas as pd
-import requests
-from dotenv import load_dotenv
+GOOGLE_BOOKS_API_URL = "https://www.googleapis.com/books/v1/volumes"
 
 # We define the import settings
 MAX_REQUESTS_PER_RUN = 900
@@ -21,8 +24,19 @@ MIN_TITLE_SIMILARITY = 0.80
 REQUEST_DELAY_SECONDS = 1
 REQUEST_TIMEOUT_SECONDS = 30
 
-# We load the environment variables from the .env file
-load_dotenv()
+# We define the retry settings
+MAX_RETRIES = 5
+RETRY_BASE_DELAY_SECONDS = 2
+RETRYABLE_STATUS_CODES = {
+    429,
+    500,
+    502,
+    503,
+    504
+}
+
+# We load the environment variables from the project .env file
+load_dotenv(PROJECT_ROOT / ".env")
 
 API_KEY = os.getenv("GOOGLE_BOOKS_API_KEY")
 
@@ -30,7 +44,6 @@ if not API_KEY:
     raise RuntimeError(
         "GOOGLE_BOOKS_API_KEY was not found in the .env file."
     )
-
 
 # We create the output directory if it does not exist
 OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -41,6 +54,10 @@ def load_saved_books():
     if not OUTPUT_FILE.exists():
         return []
 
+    # We return an empty list if the output file is empty
+    if OUTPUT_FILE.stat().st_size == 0:
+        return []
+
     try:
         with OUTPUT_FILE.open("r", encoding="utf-8") as file:
             data = json.load(file)
@@ -48,6 +65,10 @@ def load_saved_books():
         if isinstance(data, list):
             return data
 
+        print(
+            "Warning: books.json does not contain a JSON list. "
+            "We start with an empty list."
+        )
         return []
 
     except (json.JSONDecodeError, OSError):
@@ -190,9 +211,17 @@ def find_best_book(items, searched_title, searched_author):
     )
 
 
-def request_book(session, title, author):
-    url = "https://www.googleapis.com/books/v1/volumes"
+def calculate_retry_delay(retry_number):
+    # We progressively increase the waiting time after each failed attempt
+    return RETRY_BASE_DELAY_SECONDS * (2 ** retry_number)
 
+
+def request_book(
+    session,
+    title,
+    author,
+    available_requests
+):
     params = {
         "q": f'intitle:"{title}" inauthor:"{author}"',
         "key": API_KEY,
@@ -200,24 +229,94 @@ def request_book(session, title, author):
         "printType": "books"
     }
 
-    # We send one request for the current book
-    response = session.get(
-        url,
-        params=params,
-        timeout=REQUEST_TIMEOUT_SECONDS
-    )
+    requests_used = 0
 
-    response.raise_for_status()
+    for attempt in range(MAX_RETRIES):
+        if requests_used >= available_requests:
+            print(
+                "  We cannot retry because the request limit "
+                "for this run was reached."
+            )
+            return None, requests_used, True
 
-    return response.json()
+        try:
+            # We count every HTTP request, including retry attempts
+            requests_used += 1
 
+            response = session.get(
+                GOOGLE_BOOKS_API_URL,
+                params=params,
+                timeout=REQUEST_TIMEOUT_SECONDS
+            )
 
-def create_book_key(title, author):
-    # We create a normalized key used to avoid duplicate saved books
-    return (
-        normalize_text(title),
-        normalize_text(author)
-    )
+        except requests.Timeout:
+            if (
+                attempt == MAX_RETRIES - 1
+                or requests_used >= available_requests
+            ):
+                print(
+                    f"  Request timed out for '{title}' after "
+                    f"{requests_used} attempt(s)."
+                )
+                return None, requests_used, False
+
+            retry_delay = calculate_retry_delay(attempt)
+
+            print(
+                f"  Request timed out for '{title}'. "
+                f"We retry in {retry_delay} seconds."
+            )
+
+            time.sleep(retry_delay)
+            continue
+
+        except requests.RequestException as error:
+            print(f"  Network error for '{title}': {error}")
+            return None, requests_used, False
+
+        if response.status_code in RETRYABLE_STATUS_CODES:
+            if (
+                attempt == MAX_RETRIES - 1
+                or requests_used >= available_requests
+            ):
+                print(
+                    f"  HTTP {response.status_code} for '{title}' "
+                    f"after {requests_used} attempt(s)."
+                )
+
+                # We stop the run when the API quota remains unavailable
+                should_stop = response.status_code == 429
+
+                return None, requests_used, should_stop
+
+            retry_delay = calculate_retry_delay(attempt)
+
+            print(
+                f"  HTTP {response.status_code} for '{title}'. "
+                f"We retry in {retry_delay} seconds."
+            )
+
+            time.sleep(retry_delay)
+            continue
+
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as error:
+            print(
+                f"  HTTP error for '{title}': "
+                f"{response.status_code} - {error}"
+            )
+            return None, requests_used, False
+
+        try:
+            return response.json(), requests_used, False
+        except ValueError:
+            print(
+                f"  Google Books returned invalid JSON for '{title}'."
+            )
+            return None, requests_used, False
+
+    return None, requests_used, False
 
 
 def main():
@@ -233,7 +332,10 @@ def main():
         encoding="cp1252"
     )
 
-    required_columns = {"bookTitle", "authorName"}
+    required_columns = {
+        "bookTitle",
+        "authorName"
+    }
 
     missing_columns = required_columns.difference(
         books_dataframe.columns
@@ -244,16 +346,14 @@ def main():
             f"Missing CSV columns: {sorted(missing_columns)}"
         )
 
-    # We load books saved during previous runs
+    # We load the books saved during previous runs
     saved_books = load_saved_books()
 
-    # We create a set of already saved books to avoid duplicates
-    saved_book_keys = {
-        create_book_key(
-            book.get("title", ""),
-            book.get("author", "")
-        )
+    # We keep the saved titles in a set so we can check them quickly
+    saved_titles = {
+        normalize_text(book.get("title", ""))
         for book in saved_books
+        if book.get("title")
     }
 
     requests_made = 0
@@ -263,12 +363,6 @@ def main():
     # We reuse the same HTTP connection for all requests
     with requests.Session() as session:
         for _, row in books_dataframe.iterrows():
-            if requests_made >= MAX_REQUESTS_PER_RUN:
-                print(
-                    f"Stopped after {MAX_REQUESTS_PER_RUN} API requests."
-                )
-                break
-
             title = clean_title(row["bookTitle"])
             author = clean_author(row["authorName"])
 
@@ -277,21 +371,54 @@ def main():
                 books_skipped_this_run += 1
                 continue
 
+            normalized_title = normalize_text(title)
+
+            # We skip the API request when the title is already in books.json
+            if normalized_title in saved_titles:
+                print(
+                    f"Skipped: '{title}' is already saved."
+                )
+                books_skipped_this_run += 1
+                continue
+
+            if requests_made >= MAX_REQUESTS_PER_RUN:
+                print(
+                    f"Stopped after {MAX_REQUESTS_PER_RUN} API requests."
+                )
+                break
+
             print(
                 f"[{requests_made + 1}/{MAX_REQUESTS_PER_RUN}] "
                 f"Searching: {title} by {author}"
             )
 
+            available_requests = (
+                MAX_REQUESTS_PER_RUN - requests_made
+            )
+
+            response_data, requests_used, should_stop = request_book(
+                session=session,
+                title=title,
+                author=author,
+                available_requests=available_requests
+            )
+
+            requests_made += requests_used
+
+            if response_data is None:
+                books_skipped_this_run += 1
+
+                if should_stop:
+                    print(
+                        "The import was stopped because the API "
+                        "request limit is currently unavailable."
+                    )
+                    break
+
+                time.sleep(REQUEST_DELAY_SECONDS)
+                continue
+
             try:
-                # We count every API request, including failed requests
-                requests_made += 1
-
-                response_data = request_book(
-                    session,
-                    title,
-                    author
-                )
-
                 items = response_data.get("items", [])
 
                 if not items:
@@ -334,29 +461,35 @@ def main():
                 description = volume_info.get("description")
 
                 if not result_title:
-                    print("  Skipped: the result did not contain a title.")
+                    print(
+                        "  Skipped: the result did not contain a title."
+                    )
                     books_skipped_this_run += 1
                     continue
 
                 if not result_authors:
-                    print("  Skipped: the result did not contain an author.")
+                    print(
+                        "  Skipped: the result did not contain an author."
+                    )
                     books_skipped_this_run += 1
                     continue
 
                 if not description:
-                    print("  Skipped: the result did not contain a description.")
+                    print(
+                        "  Skipped: the result did not contain "
+                        "a description."
+                    )
                     books_skipped_this_run += 1
                     continue
 
                 result_author = ", ".join(result_authors)
+                normalized_result_title = normalize_text(result_title)
 
-                result_key = create_book_key(
-                    result_title,
-                    result_author
-                )
-
-                if result_key in saved_book_keys:
-                    print("  Skipped: this book is already saved.")
+                # We verify the returned title before saving it
+                if normalized_result_title in saved_titles:
+                    print(
+                        "  Skipped: the returned title is already saved."
+                    )
                     books_skipped_this_run += 1
                     continue
 
@@ -367,8 +500,12 @@ def main():
                 }
 
                 saved_books.append(book_record)
-                saved_book_keys.add(result_key)
 
+                # We remember both forms during the current run
+                saved_titles.add(normalized_title)
+                saved_titles.add(normalized_result_title)
+
+                # We save after every successful result
                 save_books(saved_books)
 
                 books_saved_this_run += 1
@@ -378,38 +515,12 @@ def main():
                     f"(similarity: {title_similarity:.2f})"
                 )
 
-            except requests.HTTPError as error:
-                status_code = (
-                    error.response.status_code
-                    if error.response is not None
-                    else "unknown"
-                )
-
-                print(
-                    f"  HTTP error for '{title}': "
-                    f"{status_code} - {error}"
-                )
-
-                if status_code == 429:
-                    print("Google Books quota was exhausted.")
-                    break
-
-                books_skipped_this_run += 1
-
-            except requests.Timeout:
-                print(f"  Request timed out for '{title}'.")
-                books_skipped_this_run += 1
-
-            except requests.RequestException as error:
-                print(f"  Network error for '{title}': {error}")
-                books_skipped_this_run += 1
-
             except Exception as error:
                 print(f"  Unexpected error for '{title}': {error}")
                 books_skipped_this_run += 1
 
             finally:
-                # We wait after every request, successful or failed
+                # We wait after processing every API response
                 time.sleep(REQUEST_DELAY_SECONDS)
 
     print()
