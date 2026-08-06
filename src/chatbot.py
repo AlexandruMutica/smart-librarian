@@ -5,6 +5,7 @@ from src.openai_client import get_openai_client
 from src.retriever import retrieve_books
 from src.tools import get_summary_by_title
 
+from src.moderation import moderate_message
 
 CHAT_MODEL = "gpt-4.1-mini"
 
@@ -188,6 +189,11 @@ class SmartLibrarianChat:
                 "Please enter a question or describe "
                 "what kind of book you want."
             )
+
+        moderation_response = moderate_message(cleaned_message)
+
+        if moderation_response is not None:
+            return moderation_response
 
         retrieval_query = self.build_retrieval_query(
             cleaned_message
